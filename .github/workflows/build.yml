@@ -1,4 +1,4 @@
-name: Build Dolby Sony 1.5 Modules
+name: Build Dolby Sony 1.5 (Fast Native C++ & APK Builder)
 
 on:
   push:
@@ -6,94 +6,98 @@ on:
   workflow_dispatch:
 
 jobs:
-  aosp-build:
-    runs-on: ubuntu-22.04 # Menggunakan Ubuntu 22.04 yang lebih stabil untuk toolchain AOSP/LineageOS
+  build-assets:
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Optimize Disk Space
-        run: |
-          df -h
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell /usr/share/swift
-          df -h
-
-      - name: Install System Dependencies (AOSP Build Tools)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            git-core gnupg flex bison build-essential zip curl zlib1g-dev \
-            libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig bc libssl-dev \
-            g++-multilib lib32z1-dev lib32ncurses5-dev x11proto-core-dev \
-            libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc unzip m4
-
-      - name: Install Repo Tool
-        run: |
-          mkdir -p ~/bin
-          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
-          chmod a+x ~/bin/repo
-          echo "$HOME/bin" >> $GITHUB_PATH
-
-      - name: Initialize Minimal Android Tree
-        run: |
-          mkdir aosp
-          cd aosp
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-          
-          # Menggunakan manifest minimal berbasis Android 14 (LineageOS 21)
-          repo init -u https://github.com/minimal-manifest-android/platform_manifest.git -b lineage-21 --depth=1
-          repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
-
-      - name: Checkout Dolby Repo to Correct Path
+      - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          path: aosp/hardware/dolby
 
-      - name: Inject Dolby into Build System
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Android SDK & NDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 34
+          build-tools: 34.0.0
+          ndk: 26.1.10909125
+
+      - name: Prepare Workspace Structure
         run: |
-          cd aosp
-          # Membuat device dummy minimal agar 'lunch' berhasil dan dolby.mk terbaca
-          mkdir -p device/generic/arm64
-          
-          # Membuat blueprint minimum agar Android build system mengenali target generic
-          # (Mengantisipasi jika manifest minimal tidak menyertakan makefile generic standar)
-          if [ ! -f device/generic/arm64/aosp_arm64.mk ]; then
-            echo -e "PRODUCT_NAME := aosp_arm64\nPRODUCT_DEVICE := generic_arm64\nPRODUCT_BRAND := Android\nPRODUCT_MODEL := AOSP on ARM64" > device/generic/arm64/aosp_arm64.mk
-            echo -e "TARGET_ARCH := arm64\nTARGET_ARCH_VARIANT := armv8-a\nTARGET_CPU_VARIANT := generic\nTARGET_2ND_ARCH := arm\nTARGET_2ND_ARCH_VARIANT := armv8-a\nTARGET_2ND_CPU_VARIANT := generic" > device/generic/arm64/BoardConfig.mk
-            echo -e "add_lunch_combo aosp_arm64-userdebug" > device/generic/arm64/vendorsetup.sh
+          mkdir -p output/apk output/libs/arm64-v8a
+
+      # --- 1. PROSES BUILD APK (LunarisDolby) ---
+      - name: Build LunarisDolby APK
+        run: |
+          echo "Checking for LunarisDolby source..."
+          if [ -d "LunarisDolby" ]; then
+            cd LunarisDolby
+            if [ -f "gradlew" ]; then
+              chmod +x gradlew
+              ./gradlew assembleRelease
+              cp app/build/outputs/apk/release/*.apk $GITHUB_WORKSPACE/output/apk/
+            else
+              echo "No gradle wrapper found, looking for prebuilt APKs..."
+              find . -name "*.apk" -exec cp {} $GITHUB_WORKSPACE/output/apk/ \;
+            fi
+          else
+            echo "LunarisDolby directory not found, checking root for prebuilts..."
+            find . -name "LunarisDolby.apk" -exec cp {} $GITHUB_WORKSPACE/output/apk/ \;
+          fi
+
+      # --- 2. PROSES BUILD NATIVE LIBRARIES (C++ Libshims) ---
+      - name: Compile C++ Source Files (Libshims)
+        run: |
+          if [ -d "libshims" ]; then
+            cd libshims
+            echo "Compiling C++ shared libraries using Android NDK Clang++..."
+            
+            # Target arsitektur arm64-v8a untuk Android API 34
+            TARGET_TRIPLE="aarch64-linux-android34"
+            TOOLCHAIN_BIN="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            
+            # Ambil semua berkas .cpp di dalam folder libshims
+            SRC_FILES=$(find . -name "*.cpp")
+            
+            if [ ! -z "$SRC_FILES" ]; then
+              echo "Found source files: $SRC_FILES"
+              
+              # Kompilasi menggunakan clang++ dengan standard C++17 dan mengabaikan beberapa warning standard shims
+              $TOOLCHAIN_BIN/${TARGET_TRIPLE}-clang++ \
+                -shared \
+                -fPIC \
+                -std=c++17 \
+                -O2 \
+                -Wall \
+                -Wno-error \
+                $SRC_FILES \
+                -o $GITHUB_WORKSPACE/output/libs/arm64-v8a/libshim_dolby.so
+                
+              echo "libshim_dolby.so compiled successfully!"
+            else
+              echo "No .cpp source files found in libshims."
+            fi
+          fi
+
+      # --- 3. PROSES PENGUMPULAN PROPRIETARY BLOBS & CONFIGS ---
+      - name: Collect Proprietary Blobs & Overlays
+        run: |
+          if [ -d "proprietary" ]; then
+            echo "Collecting proprietary vendor libraries..."
+            find proprietary/ -name "*.so" -exec cp {} output/libs/arm64-v8a/ \; 2>/dev/null || true
           fi
           
-          # Inject dolby.mk ke konfigurasi produk
-          echo "\$(call inherit-product, hardware/dolby/dolby.mk)" >> device/generic/arm64/aosp_arm64.mk
+          mkdir -p output/configs
+          cp *.xml dolby.mk README.mkdn RemovePackagesDolby output/configs/ 2>/dev/null || true
+          if [ -d "configs" ]; then cp -r configs/* output/configs/; fi
 
-      - name: Execute Compilation
-        run: |
-          cd aosp
-          # Load environment build Android
-          source build/envsetup.sh
-          
-          # Pilih target generic arm64
-          lunch aosp_arm64-userdebug
-          
-          echo "=== Compiling Dolby Core Packages ==="
-          # Mengompilasi paket sesuai list PRODUCT_PACKAGES yang ada di dolby.mk kamu
-          m LunarisDolby libshim_dolby libspatialaudio DolbyFrameworksResCommon RemovePackagesDolby \
-            vendor.dolby.hardware.dms@2.0-service vendor.dolby.media.c2@1.0-service \
-            libcodec2_soft_ac4dec libcodec2_soft_ddpdec -j$(nproc --all)
-
-      - name: Collect Output Binaries and APKs
-        run: |
-          mkdir -p output/apk output/libs
-          cd aosp/out/target/product/generic_arm64
-          
-          # Ambil hasil kompilasi APK jika ada
-          find system/app system_ext/app system/priv-app system_ext/priv-app -name "*.apk" -exec cp {} $GITHUB_WORKSPACE/output/apk/ \; 2>/dev/null || true
-          
-          # Ambil hasil shared libraries (.so)
-          find system/lib* vendor/lib* -name "*dolby*" -o -name "*shim*" -o -name "*spatialaudio*" -exec cp --parents {} $GITHUB_WORKSPACE/output/libs/ \; 2>/dev/null || true
-
-      - name: Upload Compiled Artifacts
+      - name: Upload Output Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Dolby-Sony-1.5-Artifacts
+          name: Dolby-Sony-1.5-Compiled-Package
           path: output/
           retention-days: 7
