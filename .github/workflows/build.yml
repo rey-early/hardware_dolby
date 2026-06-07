@@ -7,24 +7,30 @@ on:
 
 jobs:
   aosp-build:
-    runs-on: ubuntu-latest
-    
-    # Menggunakan container LineageOS build environment agar toolchain sudah siap
-    container:
-      image: ghcr.io/lineageos/manifest:lineage-21
+    runs-on: ubuntu-22.04 # Menggunakan Ubuntu 22.04 yang lebih stabil untuk toolchain AOSP/LineageOS
 
     steps:
       - name: Optimize Disk Space
         run: |
           df -h
-          rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell /usr/share/swift
           df -h
 
-      - name: Install System Dependencies
+      - name: Install System Dependencies (AOSP Build Tools)
         run: |
-          apt-get update && apt-get install -y \
+          sudo apt-get update
+          sudo apt-get install -y \
             git-core gnupg flex bison build-essential zip curl zlib1g-dev \
-            libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig bc libssl-dev
+            libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig bc libssl-dev \
+            g++-multilib lib32z1-dev lib32ncurses5-dev x11proto-core-dev \
+            libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc unzip m4
+
+      - name: Install Repo Tool
+        run: |
+          mkdir -p ~/bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
 
       - name: Initialize Minimal Android Tree
         run: |
@@ -33,14 +39,13 @@ jobs:
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           
-          # Inisialisasi dengan manifest minimal berbasis LineageOS 21 (Android 14)
+          # Menggunakan manifest minimal berbasis Android 14 (LineageOS 21)
           repo init -u https://github.com/minimal-manifest-android/platform_manifest.git -b lineage-21 --depth=1
           repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
 
       - name: Checkout Dolby Repo to Correct Path
         uses: actions/checkout@v4
         with:
-          # Sesuai dengan DOLBY_PATH := hardware/dolby di dolby.mk
           path: aosp/hardware/dolby
 
       - name: Inject Dolby into Build System
@@ -49,7 +54,15 @@ jobs:
           # Membuat device dummy minimal agar 'lunch' berhasil dan dolby.mk terbaca
           mkdir -p device/generic/arm64
           
-          # Inject dolby.mk ke dalam konfigurasi produk device dummy
+          # Membuat blueprint minimum agar Android build system mengenali target generic
+          # (Mengantisipasi jika manifest minimal tidak menyertakan makefile generic standar)
+          if [ ! -f device/generic/arm64/aosp_arm64.mk ]; then
+            echo -e "PRODUCT_NAME := aosp_arm64\nPRODUCT_DEVICE := generic_arm64\nPRODUCT_BRAND := Android\nPRODUCT_MODEL := AOSP on ARM64" > device/generic/arm64/aosp_arm64.mk
+            echo -e "TARGET_ARCH := arm64\nTARGET_ARCH_VARIANT := armv8-a\nTARGET_CPU_VARIANT := generic\nTARGET_2ND_ARCH := arm\nTARGET_2ND_ARCH_VARIANT := armv8-a\nTARGET_2ND_CPU_VARIANT := generic" > device/generic/arm64/BoardConfig.mk
+            echo -e "add_lunch_combo aosp_arm64-userdebug" > device/generic/arm64/vendorsetup.sh
+          fi
+          
+          # Inject dolby.mk ke konfigurasi produk
           echo "\$(call inherit-product, hardware/dolby/dolby.mk)" >> device/generic/arm64/aosp_arm64.mk
 
       - name: Execute Compilation
@@ -62,20 +75,20 @@ jobs:
           lunch aosp_arm64-userdebug
           
           echo "=== Compiling Dolby Core Packages ==="
-          # Mengompilasi aplikasi utama, shim library, dan proprietary blobs yang memiliki blueprint/makefile
+          # Mengompilasi paket sesuai list PRODUCT_PACKAGES yang ada di dolby.mk kamu
           m LunarisDolby libshim_dolby libspatialaudio DolbyFrameworksResCommon RemovePackagesDolby \
             vendor.dolby.hardware.dms@2.0-service vendor.dolby.media.c2@1.0-service \
-            libcodec2_soft_ac4dec libcodec2_soft_ddpdec
+            libcodec2_soft_ac4dec libcodec2_soft_ddpdec -j$(nproc --all)
 
       - name: Collect Output Binaries and APKs
         run: |
-          mkdir -p output/apk output/libs output/etc
+          mkdir -p output/apk output/libs
           cd aosp/out/target/product/generic_arm64
           
-          # Salin APK jika hasil build sukses
+          # Ambil hasil kompilasi APK jika ada
           find system/app system_ext/app system/priv-app system_ext/priv-app -name "*.apk" -exec cp {} $GITHUB_WORKSPACE/output/apk/ \; 2>/dev/null || true
           
-          # Salin Shared Libraries (.so) hasil kompilasi
+          # Ambil hasil shared libraries (.so)
           find system/lib* vendor/lib* -name "*dolby*" -o -name "*shim*" -o -name "*spatialaudio*" -exec cp --parents {} $GITHUB_WORKSPACE/output/libs/ \; 2>/dev/null || true
 
       - name: Upload Compiled Artifacts
