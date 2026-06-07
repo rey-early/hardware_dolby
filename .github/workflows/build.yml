@@ -1,0 +1,86 @@
+name: Build Dolby Sony 1.5 Modules
+
+on:
+  push:
+    branches: [ "main", "master", "14", "15" ]
+  workflow_dispatch:
+
+jobs:
+  aosp-build:
+    runs-on: ubuntu-latest
+    
+    # Menggunakan container LineageOS build environment agar toolchain sudah siap
+    container:
+      image: ghcr.io/lineageos/manifest:lineage-21
+
+    steps:
+      - name: Optimize Disk Space
+        run: |
+          df -h
+          rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h
+
+      - name: Install System Dependencies
+        run: |
+          apt-get update && apt-get install -y \
+            git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+            libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig bc libssl-dev
+
+      - name: Initialize Minimal Android Tree
+        run: |
+          mkdir aosp
+          cd aosp
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          
+          # Inisialisasi dengan manifest minimal berbasis LineageOS 21 (Android 14)
+          repo init -u https://github.com/minimal-manifest-android/platform_manifest.git -b lineage-21 --depth=1
+          repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+
+      - name: Checkout Dolby Repo to Correct Path
+        uses: actions/checkout@v4
+        with:
+          # Sesuai dengan DOLBY_PATH := hardware/dolby di dolby.mk
+          path: aosp/hardware/dolby
+
+      - name: Inject Dolby into Build System
+        run: |
+          cd aosp
+          # Membuat device dummy minimal agar 'lunch' berhasil dan dolby.mk terbaca
+          mkdir -p device/generic/arm64
+          
+          # Inject dolby.mk ke dalam konfigurasi produk device dummy
+          echo "\$(call inherit-product, hardware/dolby/dolby.mk)" >> device/generic/arm64/aosp_arm64.mk
+
+      - name: Execute Compilation
+        run: |
+          cd aosp
+          # Load environment build Android
+          source build/envsetup.sh
+          
+          # Pilih target generic arm64
+          lunch aosp_arm64-userdebug
+          
+          echo "=== Compiling Dolby Core Packages ==="
+          # Mengompilasi aplikasi utama, shim library, dan proprietary blobs yang memiliki blueprint/makefile
+          m LunarisDolby libshim_dolby libspatialaudio DolbyFrameworksResCommon RemovePackagesDolby \
+            vendor.dolby.hardware.dms@2.0-service vendor.dolby.media.c2@1.0-service \
+            libcodec2_soft_ac4dec libcodec2_soft_ddpdec
+
+      - name: Collect Output Binaries and APKs
+        run: |
+          mkdir -p output/apk output/libs output/etc
+          cd aosp/out/target/product/generic_arm64
+          
+          # Salin APK jika hasil build sukses
+          find system/app system_ext/app system/priv-app system_ext/priv-app -name "*.apk" -exec cp {} $GITHUB_WORKSPACE/output/apk/ \; 2>/dev/null || true
+          
+          # Salin Shared Libraries (.so) hasil kompilasi
+          find system/lib* vendor/lib* -name "*dolby*" -o -name "*shim*" -o -name "*spatialaudio*" -exec cp --parents {} $GITHUB_WORKSPACE/output/libs/ \; 2>/dev/null || true
+
+      - name: Upload Compiled Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dolby-Sony-1.5-Artifacts
+          path: output/
+          retention-days: 7
